@@ -1,0 +1,13 @@
+[project]
+name = "feng-commerce-api"
+version = "0.1.0"
+description = "Mock API for the Feng commerce support console"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.116,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
