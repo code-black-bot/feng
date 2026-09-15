@@ -655,16 +655,25 @@ select:focus-visible {
 }
 
 .metric-value {
-  margin-top: 15px;
-  font-family: Georgia, serif;
-  font-size: clamp(28px, 3vw, 38px);
-  letter-spacing: -0.035em;
+  margin-top: 18px;
+  color: #272923;
+  font-family: "Inter", "SF Pro Display", "PingFang SC", system-ui, sans-serif;
+  font-size: clamp(30px, 3vw, 40px);
+  font-weight: 680;
+  line-height: 0.95;
+  letter-spacing: -0.045em;
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: "tnum" 1, "lnum" 1;
 }
 
 .metric-value small {
-  margin-left: 3px;
+  margin-left: 4px;
+  color: var(--ink-soft);
   font-family: inherit;
-  font-size: 17px;
+  font-size: 0.46em;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  vertical-align: 0.14em;
 }
 
 .metric p {
