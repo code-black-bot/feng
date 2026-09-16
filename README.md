@@ -1,8 +1,8 @@
 # FENG 商家智能工作台
 
-电商订单、售后与 AI Agent 可观测性后台的第一版实现。
+电商订单、售后、AI 数据问答与 Agent 可观测性后台的第一版实现。
 
-当前版本使用 Mock 数据，不连接真实淘宝、MySQL 或模型服务。项目已经保留清晰的 BFF、业务 API 和 Agent 观测接口边界，后续可以逐步替换数据源。
+当前版本使用 Mock 订单数据，但 Agent 已通过 OpenAI-compatible Responses API 调用真实模型。模型只能通过只读 MCP 工具查询订单，不会直接访问数据库。后续可以逐步将订单数据源替换为 MySQL 与淘宝开放平台。
 
 ## 已实现
 
@@ -13,6 +13,9 @@
 - 按模型统计调用量与成本
 - 工具调用稳定性
 - Agent Run 日志搜索与调用链详情
+- 对话式 Agent 工作台，可直接询问订单数量、金额、状态和物流
+- 标准 MCP JSON-RPC 入口与 4 个只读订单工具
+- Agent 工具调用过程、参数、结果摘要与用量展示
 - 淘宝渠道连接和同步状态
 - Node BFF 的请求编号、限流、安全响应头与流式代理基础
 - Python FastAPI 接口及无需第三方依赖的本地 Mock Server
@@ -31,6 +34,19 @@ feng/
 ## 本地运行
 
 需要三个终端。
+
+### 配置本地 API Key
+
+在项目根目录创建 `.env.local`：
+
+~~~dotenv
+OPENAI_API_KEY=你的密钥
+OPENAI_BASE_URL=https://www.aivalux.com/v1
+OPENAI_MODEL=gpt-5.5
+OPENAI_TIMEOUT_SECONDS=60
+~~~
+
+`.env.local` 已被 Git 忽略，密钥只会由本地 Python 后端读取。不要把密钥写进 `NEXT_PUBLIC_` 变量、React 代码、`.env.example`、日志或聊天消息中。模型请求使用 Responses API，并设置 `store=False`。
 
 ### 1. 启动 Python Mock API
 
@@ -67,12 +83,12 @@ npm run dev
 
 浏览器打开：http://localhost:3000
 
-页面右上角显示“API 数据”表示 React 已经通过 Node BFF 读取 Python Mock API；显示“前端 Mock”时页面仍可操作，但服务端链路尚未连接。
+页面右上角显示“API 数据”表示 React 已经通过 Node BFF 读取 Python Mock API；显示“前端 Mock”时页面仍可操作，但服务端链路尚未连接。进入“Agent 助手”后，可以尝试“今天有多少订单”“查看待发货订单”或“订单 TB202609150086 的物流到哪里了”。
 
 ## 验证
 
 ~~~bash
-python3 -m unittest discover -s services/api/tests
+PYTHONPATH=services/api python3 -m unittest discover -s services/api/tests
 npm --prefix apps/bff test
 npm run build
 ~~~
@@ -82,5 +98,5 @@ npm run build
 1. 用 SQLAlchemy + MySQL 替换 Python Mock 数据。
 2. 实现商家登录和租户隔离。
 3. 接入淘宝开放平台 OAuth 和订单同步。
-4. 接入单 Agent 与受控订单查询工具。
-5. 将真实模型 usage、工具事件和错误写入观测接口。
+4. 将内存会话与运行日志写入 MySQL。
+5. 根据实际供应商价格配置精确的调用成本计算。

@@ -8,6 +8,7 @@ before Python dependencies are installed.
 from __future__ import annotations
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -24,10 +25,17 @@ from app.mock_data import (  # noqa: E402
     dashboard_summary,
     observability_overview,
 )
+from app.agent_runtime import (  # noqa: E402
+    AgentConfigurationError,
+    AgentProviderError,
+    run_agent_turn,
+)
+from app.mcp_tools import handle_mcp_request, list_tools  # noqa: E402
+from app.settings import openai_settings  # noqa: E402
 
 
-HOST = "127.0.0.1"
-PORT = 8000
+HOST = os.getenv("API_HOST", "127.0.0.1")
+PORT = int(os.getenv("API_PORT", "8000"))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -104,10 +112,49 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"items": CHANNELS})
             return
         if path == "/internal/v1/agent/status":
-            self._send({"configured": False, "mode": "mock"})
+            provider = openai_settings()
+            self._send(
+                {
+                    "configured": provider["configured"],
+                    "mode": "live" if provider["configured"] else "unconfigured",
+                    "provider": "openai-compatible",
+                    "credential_configured": provider["credential_configured"],
+                    "configured_model": provider["model"],
+                    "mcp_server": "feng-commerce-mcp",
+                    "tools": [tool["name"] for tool in list_tools()],
+                }
+            )
             return
 
         self._send({"error": "Not found", "path": path}, 404)
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 1_000_000:
+            raise ValueError("Request body is too large")
+        raw = self.rfile.read(length) if length else b"{}"
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("JSON body must be an object")
+        return payload
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        try:
+            payload = self._read_json()
+            if path == "/internal/v1/agent/chat":
+                self._send(run_agent_turn(payload, self.headers.get("x-demo-user", "merchant_demo")))
+                return
+            if path == "/internal/v1/mcp":
+                self._send(handle_mcp_request(payload) or {"ok": True})
+                return
+            self._send({"error": "Not found", "path": path}, 404)
+        except AgentConfigurationError as error:
+            self._send({"error": str(error)}, 503)
+        except AgentProviderError as error:
+            self._send({"error": str(error)}, 502)
+        except (json.JSONDecodeError, ValueError) as error:
+            self._send({"error": str(error)}, 400)
 
     def log_message(self, format: str, *args: object) -> None:
         print(

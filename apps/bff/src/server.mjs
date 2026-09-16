@@ -17,6 +17,8 @@ const routeMap = [
   ["/api/v1/observability/logs", "/internal/v1/observability/logs"],
   ["/api/v1/channels", "/internal/v1/channels"],
   ["/api/v1/agent/status", "/internal/v1/agent/status"],
+  ["/api/v1/agent/chat", "/internal/v1/agent/chat"],
+  ["/api/v1/mcp", "/internal/v1/mcp"],
 ];
 
 function json(res, status, payload, requestId) {
@@ -137,6 +139,7 @@ const server = createServer(async (req, res) => {
         ? undefined
         : await readBody(req);
     const targetUrl = new URL(targetPath + url.search, pythonBaseUrl);
+    const upstreamTimeout = url.pathname.startsWith("/api/v1/agent/") ? 60_000 : 15_000;
     const upstream = await fetch(targetUrl, {
       method: req.method,
       body,
@@ -145,7 +148,7 @@ const server = createServer(async (req, res) => {
         "x-request-id": requestId,
         "x-demo-user": "merchant_demo",
       },
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(upstreamTimeout),
     });
 
     res.statusCode = upstream.status;

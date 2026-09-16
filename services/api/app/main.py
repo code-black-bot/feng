@@ -3,6 +3,9 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 
+from .agent_runtime import AgentConfigurationError, AgentProviderError, run_agent_turn
+from .mcp_tools import handle_mcp_request, list_tools
+from .settings import openai_settings
 from .mock_data import (
     CHANNELS,
     ORDERS,
@@ -111,11 +114,37 @@ def list_channels() -> dict:
 
 @app.get("/internal/v1/agent/status")
 def agent_status() -> dict:
+    provider = openai_settings()
     return {
-        "configured": False,
-        "mode": "mock",
-        "message": "Agent runtime is reserved for the next iteration.",
+        "configured": provider["configured"],
+        "mode": "live" if provider["configured"] else "unconfigured",
+        "provider": "openai-compatible",
+        "credential_configured": provider["credential_configured"],
+        "configured_model": provider["model"],
+        "mcp_server": "feng-commerce-mcp",
+        "tools": [tool["name"] for tool in list_tools()],
+        "message": "真实 Responses API 已配置，订单数据仍通过只读 MCP 工具访问。"
+        if provider["configured"]
+        else "请在本地 .env.local 中配置 OPENAI_API_KEY。",
     }
+
+
+@app.post("/internal/v1/agent/chat")
+def agent_chat(payload: dict, request: Request) -> dict:
+    try:
+        return run_agent_turn(payload, request.headers.get("x-demo-user", "merchant_demo"))
+    except AgentConfigurationError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except AgentProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.post("/internal/v1/mcp")
+def mcp_endpoint(payload: dict) -> dict:
+    response = handle_mcp_request(payload)
+    return response or {"ok": True}
 
 
 @app.middleware("http")

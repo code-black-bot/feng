@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-type ViewId = "overview" | "orders" | "tickets" | "observability" | "logs" | "channels";
+type ViewId = "overview" | "agent" | "orders" | "tickets" | "observability" | "logs" | "channels";
 
 type Order = {
   id: string; order_no: string; customer: string; customer_initial: string;
@@ -24,8 +24,35 @@ type RunLog = {
   timeline: Array<{ label: string; time_ms: number; detail: string }>;
 };
 
+type AgentToolCall = {
+  id: string; name: string; arguments: Record<string, unknown>; status: string;
+  duration_ms: number; result_preview: string;
+};
+
+type AgentUsage = {
+  input_tokens: number; output_tokens: number; total_tokens: number; estimated_cost: number;
+};
+
+type AgentReply = {
+  session_id: string; request_id: string; run_id: string; mode: "mock" | "live";
+  model: string; message: string; tool_calls: AgentToolCall[]; usage: AgentUsage;
+  first_token_ms?: number; duration_ms?: number; suggestions?: string[];
+};
+
+type AgentStatus = {
+  configured: boolean; mode: "live" | "unconfigured"; provider: string;
+  credential_configured: boolean; configured_model: string; message?: string;
+};
+
+type ChatMessage = {
+  id: string; role: "user" | "assistant"; content: string;
+  tool_calls?: AgentToolCall[]; usage?: AgentUsage; request_id?: string;
+  first_token_ms?: number; duration_ms?: number;
+};
+
 const navigation: Array<{ id: ViewId; label: string; short: string; description: string }> = [
   { id: "overview", label: "运营总览", short: "总", description: "今日经营与待办" },
+  { id: "agent", label: "Agent 助手", short: "问", description: "用对话查询业务数据" },
   { id: "orders", label: "订单管理", short: "单", description: "淘宝订单与物流" },
   { id: "tickets", label: "售后工单", short: "售", description: "审核与处理进度" },
   { id: "observability", label: "AI 观测", short: "AI", description: "Token、成本与性能" },
@@ -118,6 +145,7 @@ const mockLogs: RunLog[] = [
 
 const pageMeta: Record<ViewId, { eyebrow: string; title: string; subtitle: string }> = {
   overview: { eyebrow: "9月15日 · 周二", title: "下午好，Matthew", subtitle: "风桥数码旗舰店的运营情况已更新。" },
+  agent: { eyebrow: "Agent Workspace", title: "业务数据助手", subtitle: "通过受控 MCP 工具，用自然语言查询订单与物流。" },
   orders: { eyebrow: "交易中心", title: "订单管理", subtitle: "查看从淘宝同步的订单、商品与物流状态。" },
   tickets: { eyebrow: "客户体验", title: "售后工单", subtitle: "优先处理高风险和等待时间较长的售后请求。" },
   observability: { eyebrow: "AI Operations", title: "AI 运行观测", subtitle: "跟踪 Token、费用、延迟、工具表现与风险趋势。" },
@@ -127,8 +155,30 @@ const pageMeta: Record<ViewId, { eyebrow: string; title: string; subtitle: strin
 
 const BFF_URL = process.env.NEXT_PUBLIC_BFF_URL ?? "http://localhost:3001";
 
+function apiErrorMessage(payload: unknown, status: number): string {
+  if (!payload || typeof payload !== "object") return `HTTP ${status}`;
+  const body = payload as Record<string, unknown>;
+  if (typeof body.detail === "string") return body.detail;
+  if (body.detail && typeof body.detail === "object") {
+    const detail = body.detail as Record<string, unknown>;
+    if (typeof detail.message === "string") return detail.message;
+  }
+  if (typeof body.error === "string") return body.error;
+  if (body.error && typeof body.error === "object") {
+    const error = body.error as Record<string, unknown>;
+    const code = typeof error.code === "string" ? error.code : `HTTP_${status}`;
+    const message = typeof error.message === "string" ? error.message : "请求失败";
+    return `${code}：${message}`;
+  }
+  return `HTTP ${status}`;
+}
+
 function formatNumber(value: number) {
   return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 1 }).format(value);
+}
+
+function formatLatency(value: number) {
+  return value < 1000 ? `${value}ms` : `${(value / 1000).toFixed(1)}s`;
 }
 
 function Status({ value, label }: { value: string; label: string }) {
@@ -438,6 +488,196 @@ function Channels() {
   );
 }
 
+const agentSuggestions = [
+  "查看待发货订单",
+  "订单总额是多少？",
+  "查询 TB202609150086 的物流",
+  "周子涵买了什么？",
+];
+
+function AgentWorkspace() {
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [runtime, setRuntime] = useState<"checking" | "live" | "error">("checking");
+  const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
+  const messagesRef = useRef<HTMLDivElement>(null);
+  const followLatestRef = useRef(true);
+  const requestStartedAtRef = useRef<number | null>(null);
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: "welcome",
+      role: "assistant",
+      content: "你好，我是风桥订单助手。你可以直接问我订单数量、客户购买记录、订单状态或物流进度。我只会通过已授权的只读 MCP 工具访问业务数据。",
+    },
+  ]);
+
+  const lastAssistant = messages.slice().reverse().find((message) => message.role === "assistant" && message.tool_calls?.length);
+  const lastTools = lastAssistant?.tool_calls ?? [];
+
+  useEffect(() => {
+    fetch(BFF_URL + "/api/v1/agent/status")
+      .then(async (response) => {
+        if (!response.ok) throw new Error("STATUS_UNAVAILABLE");
+        return response.json() as Promise<AgentStatus>;
+      })
+      .then((status) => {
+        setAgentStatus(status);
+        setRuntime(status.configured ? "live" : "error");
+      })
+      .catch(() => setRuntime("error"));
+  }, []);
+
+  useEffect(() => {
+    if (!followLatestRef.current) {
+      setShowJumpToBottom(true);
+      return;
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const container = messagesRef.current;
+      if (!container) return;
+      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+      setShowJumpToBottom(false);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages, loading]);
+
+  useEffect(() => {
+    if (!loading || requestStartedAtRef.current === null) return;
+    const updateElapsed = () => setElapsedMs(Math.round(performance.now() - (requestStartedAtRef.current ?? performance.now())));
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 100);
+    return () => window.clearInterval(timer);
+  }, [loading]);
+
+  const handleMessageScroll = () => {
+    const container = messagesRef.current;
+    if (!container) return;
+    const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    const isNearBottom = distanceToBottom < 72;
+    followLatestRef.current = isNearBottom;
+    setShowJumpToBottom(!isNearBottom);
+  };
+
+  const jumpToBottom = () => {
+    const container = messagesRef.current;
+    if (!container) return;
+    followLatestRef.current = true;
+    setShowJumpToBottom(false);
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+  };
+
+  const resetChat = () => {
+    followLatestRef.current = true;
+    setSessionId(null);
+    setMessages([{ id: "welcome-reset", role: "assistant", content: "新会话已创建。想先查看哪些订单数据？" }]);
+    setInput("");
+  };
+
+  const sendMessage = async (rawQuestion?: string) => {
+    const question = (rawQuestion ?? input).trim();
+    if (!question || loading) return;
+    const userMessage: ChatMessage = { id: `user_${Date.now()}`, role: "user", content: question };
+    requestStartedAtRef.current = performance.now();
+    setElapsedMs(0);
+    followLatestRef.current = true;
+    setMessages((current) => [...current, userMessage]);
+    setInput("");
+    setLoading(true);
+
+    try {
+      const response = await fetch(BFF_URL + "/api/v1/agent/chat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, message: question }),
+      });
+      if (!response.ok) {
+        const failed: unknown = await response.json().catch(() => null);
+        throw new Error(apiErrorMessage(failed, response.status));
+      }
+      const payload = await response.json() as AgentReply;
+      const clientDurationMs = requestStartedAtRef.current === null ? 0 : Math.round(performance.now() - requestStartedAtRef.current);
+      setSessionId(payload.session_id);
+      setRuntime("live");
+      setMessages((current) => [...current, {
+        id: payload.run_id, role: "assistant", content: payload.message,
+        tool_calls: payload.tool_calls, usage: payload.usage, request_id: payload.request_id,
+        first_token_ms: payload.first_token_ms, duration_ms: payload.duration_ms ?? clientDurationMs,
+      }]);
+    } catch (error) {
+      setRuntime("error");
+      const reason = error instanceof Error ? error.message : "未知错误";
+      const clientDurationMs = requestStartedAtRef.current === null ? undefined : Math.round(performance.now() - requestStartedAtRef.current);
+      setMessages((current) => [...current, {
+        id: `error_${Date.now()}`, role: "assistant",
+        content: `真实模型调用失败：${reason}。请检查本地 API Key、Base URL 和模型名称后重试。`,
+        duration_ms: clientDurationMs,
+      }]);
+    } finally {
+      requestStartedAtRef.current = null;
+      setLoading(false);
+    }
+  };
+
+  return (
+    <section className="agent-shell">
+      <aside className="agent-sessions">
+        <div className="agent-sessions-head"><span>会话</span><button onClick={resetChat} aria-label="新建会话">＋</button></div>
+        <button className="agent-session active"><span>订单运营分析</span><small>刚刚 · 当前会话</small></button>
+        <button className="agent-session"><span>售后原因汇总</span><small>昨天 · 6 条消息</small></button>
+        <button className="agent-session"><span>物流异常排查</span><small>9月14日 · 4 条消息</small></button>
+        <div className="agent-session-note"><i>只读</i><p>当前 Agent 不能修改订单、退款或创建工单。</p></div>
+      </aside>
+
+      <div className="agent-chat">
+        <div className="agent-chat-head">
+          <div><span className="agent-avatar">F</span><div><strong>订单运营 Agent</strong><small><i />{runtime === "live" ? "Responses API 已配置" : runtime === "error" ? "真实模型连接异常" : "正在检查模型配置"}</small></div></div>
+          <button className="agent-new-chat" onClick={resetChat}>新建对话</button>
+        </div>
+
+        <div className="agent-scroll-region">
+          <div ref={messagesRef} className="agent-messages" aria-live="polite" onScroll={handleMessageScroll}>
+            {messages.map((message) => (
+              <article key={message.id} className={`agent-message ${message.role}`}>
+                <span className="message-avatar">{message.role === "assistant" ? "F" : "M"}</span>
+                <div className="message-body">
+                  <div className="message-copy">{message.content}</div>
+                  {message.tool_calls?.map((tool) => (
+                    <details className="message-tool" key={tool.id}>
+                      <summary><span><i />已调用 {tool.name}</span><small>{tool.duration_ms}ms⌄</small></summary>
+                      <div><code>{JSON.stringify(tool.arguments)}</code><p>{tool.result_preview}</p></div>
+                    </details>
+                  ))}
+                  {message.duration_ms ? <small className="message-performance"><i />反应速度 {formatLatency(message.duration_ms)}{message.first_token_ms ? <span>首轮响应 {formatLatency(message.first_token_ms)}</span> : null}</small> : null}
+                  {message.usage ? <small className="message-usage">{message.usage.total_tokens} tokens · ¥{message.usage.estimated_cost.toFixed(3)} · {message.request_id}</small> : null}
+                </div>
+              </article>
+            ))}
+            {loading ? <article className="agent-message assistant"><span className="message-avatar">F</span><div className="message-body"><div className="agent-thinking"><i /><i /><i /><span>正在选择 MCP 工具 · {formatLatency(elapsedMs)}</span></div></div></article> : null}
+          </div>
+          {showJumpToBottom ? <button type="button" className="agent-jump-bottom" onClick={jumpToBottom} aria-label="回到最新消息"><span>↓</span>回到底部</button> : null}
+        </div>
+
+        <div className="agent-starters">
+          {agentSuggestions.map((suggestion) => <button key={suggestion} onClick={() => void sendMessage(suggestion)} disabled={loading}>{suggestion}<span>↗</span></button>)}
+        </div>
+        <form className="agent-composer" onSubmit={(event) => { event.preventDefault(); void sendMessage(); }}>
+          <textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder="询问订单、客户、物流或经营数据…" rows={2} />
+          <div><span>Enter 发送 · Shift + Enter 换行</span><button type="submit" disabled={!input.trim() || loading} aria-label="发送消息">↑</button></div>
+        </form>
+      </div>
+
+      <aside className="agent-inspector">
+        <div className="inspector-section"><span className="inspector-label">运行配置</span><dl><div><dt>Agent</dt><dd>订单运营 Agent</dd></div><div><dt>模型</dt><dd>{agentStatus?.configured_model ?? "读取中"}</dd></div><div><dt>模型服务</dt><dd>{agentStatus?.provider ?? "openai-compatible"}</dd></div><div><dt>数据域</dt><dd>淘宝订单 · Mock</dd></div><div><dt>会话</dt><dd>{sessionId ? sessionId.slice(0, 16) : "未开始"}</dd></div></dl></div>
+        <div className="inspector-section"><span className="inspector-label">订单 MCP 工具</span><div className="mcp-tools"><div><i>查</i><span><strong>search_orders</strong><small>筛选订单列表</small></span></div><div><i>详</i><span><strong>get_order_detail</strong><small>读取订单详情</small></span></div><div><i>运</i><span><strong>get_shipping_status</strong><small>查询物流节点</small></span></div><div><i>统</i><span><strong>get_order_summary</strong><small>汇总经营数据</small></span></div></div></div>
+        <div className="inspector-section"><span className="inspector-label">最近一次工具调用</span>{lastTools.length ? lastTools.map((tool) => <div className="inspector-call" key={tool.id}><div><strong>{tool.name}</strong><span>{tool.status}</span></div><code>{JSON.stringify(tool.arguments, null, 2)}</code><p>{tool.result_preview}</p></div>) : <p className="inspector-empty">发送一条消息后，这里会展示 Agent 的工具调用与参数。</p>}</div>
+      </aside>
+    </section>
+  );
+}
+
 export default function Home() {
   const [view, setView] = useState<ViewId>("overview");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -478,9 +718,9 @@ export default function Home() {
         <div className="brand"><span className="brand-mark">F</span><div><strong>FENG</strong><small>商家智能工作台</small></div></div>
         <nav aria-label="主要导航">
           <span className="nav-label">工作台</span>
-          {navigation.slice(0, 3).map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => selectView(item.id)}><span className="nav-icon">{item.short}</span><span><strong>{item.label}</strong><small>{item.description}</small></span></button>)}
+          {navigation.slice(0, 4).map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => selectView(item.id)}><span className="nav-icon">{item.short}</span><span><strong>{item.label}</strong><small>{item.description}</small></span></button>)}
           <span className="nav-label nav-label-spaced">系统</span>
-          {navigation.slice(3).map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => selectView(item.id)}><span className="nav-icon">{item.short}</span><span><strong>{item.label}</strong><small>{item.description}</small></span>{item.id === "logs" ? <i className="nav-count">3</i> : null}</button>)}
+          {navigation.slice(4).map((item) => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => selectView(item.id)}><span className="nav-icon">{item.short}</span><span><strong>{item.label}</strong><small>{item.description}</small></span>{item.id === "logs" ? <i className="nav-count">3</i> : null}</button>)}
         </nav>
         <div className="sidebar-bottom">
           <div className="plan-usage"><div><span>本月 AI 预算</span><strong>¥184 / ¥500</strong></div><div className="usage-track"><i /></div><small>还可使用 63.2%</small></div>
@@ -496,6 +736,7 @@ export default function Home() {
         </header>
         <div className="content">
           {view === "overview" ? <Overview setView={selectView} orders={orders} /> : null}
+          {view === "agent" ? <AgentWorkspace /> : null}
           {view === "orders" ? <Orders orders={orders} /> : null}
           {view === "tickets" ? <Tickets tickets={tickets} /> : null}
           {view === "observability" ? <Observability data={observability} /> : null}
